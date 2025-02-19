@@ -1,367 +1,350 @@
-library(dplyr)
-library(xgboost)
+###############################################################################
+# 0) Libraries
+###############################################################################
+library(tidyverse)
 library(caret)
+library(xgboost)
 
-# Load data (assumes the CSV files are in your working directory)
-DataDictionary <- read.csv("DataDictionary.csv")
-test <- read.csv("East Regional Games to predict.csv")
-train <- read.csv("games_2022.csv")
-region_groups <- read.csv("Team Region Groups.csv")
+###############################################################################
+# 1) Define the Whole-History Rating (WHR) Functions
+###############################################################################
+expected_home_win_prob <- function(rh, ra, home_field_advantage = 32, c = 0.01) {
+  1 / (1 + exp(-((rh + home_field_advantage) - ra) * c))
+}
 
-# Data Wrangling
-stats <- train |> 
-  group_by(team) |> 
-  summarize(
-    FG2_percentage = mean(FGM_2 / FGA_2, na.rm = TRUE),
-    FG3_percentage = mean(FGM_3 / FGA_3, na.rm = TRUE),
-    FT_percentage = mean(FTM / FTA, na.rm = TRUE), 
-    AST = mean(AST, na.rm = TRUE), 
-    BLK = mean(BLK, na.rm = TRUE), 
-    STL = mean(STL, na.rm = TRUE), 
-    TOV = mean(TOV, na.rm = TRUE), 
-    TOV_team = mean(TOV_team, na.rm = TRUE), 
-    DREB = mean(DREB, na.rm = TRUE), 
-    OREB = mean(OREB, na.rm = TRUE), 
-    F_tech = mean(F_tech, na.rm = TRUE),
-    F_personal = mean(F_personal, na.rm = TRUE), 
-    average_score = mean(team_score[is.na(OT_length_min_tot)], na.rm = TRUE),
-    largest_lead = mean(largest_lead), 
-    notD1_incomplete = any(notD1_incomplete), 
-    attendance = mean(attendance, na.rm = TRUE)
-  )
+update_ratings_for_game <- function(rh, ra, outcome_home,
+                                    k = 20,
+                                    home_field_advantage = 32,
+                                    c = 0.01,
+                                    margin_of_victory = 1) {
+  p_home <- expected_home_win_prob(rh, ra, home_field_advantage, c)
+  error_home <- outcome_home - p_home
+  error_away <- (1 - outcome_home) - (1 - p_home)
+  list(rh = rh + k * error_home * margin_of_victory,
+       ra = ra + k * error_away * margin_of_victory)
+}
 
-test <- test |> 
-  left_join(
-    stats |> rename_with(~ paste0(.x, "_home"), -team), 
-    by = join_by(team_home == team)
-  ) |> 
-  left_join(
-    stats |> rename_with(~ paste0(.x, "_away"), -team), 
-    by = join_by(team_away == team)
-  ) |> 
-  dplyr::select(
-    FG2_percentage_home, 
-    FG2_percentage_away, 
-    FG3_percentage_home,
-    FG3_percentage_away,
-    FT_percentage_home,
-    FT_percentage_away,
-    AST_home,
-    AST_away,
-    BLK_home,
-    BLK_away,
-    STL_home,
-    STL_away,
-    TOV_home,
-    TOV_away,
-    TOV_team_home,
-    TOV_team_away,
-    DREB_home,
-    DREB_away,
-    OREB_home,
-    OREB_away,
-    F_tech_home,
-    F_tech_away,
-    F_personal_home,
-    F_personal_away,
-    average_score_home,
-    average_score_away,
-    largest_lead_home,
-    largest_lead_away,
-    notD1_incomplete_home,
-    notD1_incomplete_away,
-    attendance_home,
-    attendance_away,
-    home_away_NS,
-    rest_days_Home,
-    rest_days_Away,
-    travel_dist_Home,
-    travel_dist_Away
-  ) |> 
-  rename(
-    rest_days_home = rest_days_Home,
-    rest_days_away = rest_days_Away,
-    travel_dist_home = travel_dist_Home,
-    travel_dist_away = travel_dist_Away
-  )
+whr_pass <- function(ratings, df_games, k, home_field_advantage, c, margin_func = NULL) {
+  for (i in seq_len(nrow(df_games))) {
+    rowi <- df_games[i, ]
+    home_team <- rowi[["team_home"]]
+    away_team <- rowi[["team_away"]]
+    outcome_home <- rowi[["home_win"]]
+    margin_val <- if (!is.null(margin_func)) margin_func(rowi) else 1
+    old_rh <- ratings[home_team]
+    old_ra <- ratings[away_team]
+    updated <- update_ratings_for_game(
+      rh = old_rh, 
+      ra = old_ra, 
+      outcome_home = outcome_home,
+      k = k, 
+      home_field_advantage = home_field_advantage, 
+      c = c, 
+      margin_of_victory = margin_val
+    )
+    ratings[home_team] <- updated$rh
+    ratings[away_team] <- updated$ra
+  }
+  ratings
+}
 
-cummean_if <- function(x, condition) {
-  n <- length(x)
-  out <- numeric(n)
-  for (i in seq_len(n)) {
-    if (i == 1) {
-      out[i] <- NA
-    } else {
-      valid <- condition[1:(i - 1)]
-      if (sum(valid) == 0) {
-        out[i] <- NA
-      } else {
-        out[i] <- mean(x[1:(i - 1)][valid], na.rm = TRUE)
-      }
+run_whole_history_rating <- function(df_games,
+                                     init_rating = 1500,
+                                     k = 20,
+                                     home_field_advantage = 32,
+                                     c = 0.01,
+                                     margin_func = NULL,
+                                     max_iter = 50,
+                                     tol = 0.0005) {
+  all_teams <- unique(c(df_games$team_home, df_games$team_away))
+  ratings <- rep(init_rating, length(all_teams))
+  names(ratings) <- all_teams
+  
+  for (iter in seq_len(max_iter)) {
+    old_ratings <- ratings
+    ratings <- whr_pass(ratings, df_games, k, home_field_advantage, c, margin_func)
+    avg_change <- mean(abs(ratings - old_ratings))
+    cat(sprintf("Iteration %d: avg rating change = %.4f\n", iter, avg_change))
+    if (avg_change < tol) {
+      cat(sprintf("Converged at iteration %d\n", iter))
+      break
     }
   }
-  out
+  ratings
 }
 
-cumany <- function(x) {
-  out <- logical(length(x))
-  acc <- FALSE
-  for (i in seq_along(x)) {
-    acc <- acc | x[i]
-    out[i] <- acc
-  }
-  out
-}
+###############################################################################
+# 2) Read and Aggregate the Training Data
+###############################################################################
+train_raw_path <- "games_2022.csv"
+test_raw_path  <- "East Regional Games to predict.csv"
 
-train_pregame <- train %>%
-  arrange(team, game_date) %>%   
-  group_by(team) %>%
-  mutate(
-    FG2_percentage = lag(cummean(FGM_2 / FGA_2)),
-    FG3_percentage = lag(cummean(FGM_3 / FGA_3)),
-    FT_percentage  = lag(cummean(FTM / FTA)),
-    AST         = lag(cummean(AST)),
-    BLK         = lag(cummean(BLK)),
-    STL         = lag(cummean(STL)),
-    TOV         = lag(cummean(TOV)),
-    TOV_team    = lag(cummean(TOV_team)),
-    DREB        = lag(cummean(DREB)),
-    OREB        = lag(cummean(OREB)),
-    F_tech      = lag(cummean(F_tech)),
-    F_personal  = lag(cummean(F_personal)),
-    largest_lead = lag(cummean(largest_lead)),
-    attendance  = lag(cummean(attendance)),
-    average_score = cummean_if(team_score, is.na(OT_length_min_tot)),
-    notD1_incomplete = lag(cumany(notD1_incomplete))
-  ) %>%
-  dplyr::select(
-    game_id,
-    game_date,
-    team,
-    FG2_percentage, 
-    FG3_percentage,
-    FT_percentage,
-    AST,
-    BLK,
-    STL,
-    TOV,
-    TOV_team,
-    DREB,
-    OREB,
-    F_tech,
-    F_personal,
-    average_score,
-    largest_lead,
-    notD1_incomplete,
-    attendance,
-    home_away_NS,
-    rest_days,
-    travel_dist,
-    home_away, 
-    team_score,
-    opponent_team_score
-  ) |> 
-  ungroup()
+train_raw <- read.csv(train_raw_path)
+test_raw  <- read.csv(test_raw_path)
 
-train_home <- train_pregame %>%
-  filter(home_away == "home") %>%
-  dplyr::select(-home_away) 
-
-train_away <- train_pregame %>%
-  filter(home_away == "away") %>%
-  dplyr::select(-home_away)
-
-merged_games <- inner_join(
-  train_home,
-  train_away,
-  by = c("game_id", "game_date"),
-  suffix = c("_home", "_away")
-) |>
-  mutate(
-    home_win = if_else(team_score_home > opponent_team_score_home, 1, 0)
-  ) |> 
-  dplyr::select(
-    FG2_percentage_home, 
-    FG2_percentage_away, 
-    FG3_percentage_home,
-    FG3_percentage_away,
-    FT_percentage_home,
-    FT_percentage_away,
-    AST_home,
-    AST_away,
-    BLK_home,
-    BLK_away,
-    STL_home,
-    STL_away,
-    TOV_home,
-    TOV_away,
-    TOV_team_home,
-    TOV_team_away,
-    DREB_home,
-    DREB_away,
-    OREB_home,
-    OREB_away,
-    F_tech_home,
-    F_tech_away,
-    F_personal_home,
-    F_personal_away,
-    average_score_home,
-    average_score_away,
-    largest_lead_home,
-    largest_lead_away,
-    notD1_incomplete_home,
-    notD1_incomplete_away,
-    attendance_home,
-    attendance_away,
-    home_away_NS_home,
-    rest_days_home,
-    rest_days_away,
-    travel_dist_home,
-    travel_dist_away,
-    home_win
-  ) |> 
-  rename(
-    home_away_NS = home_away_NS_home
+# Aggregate train_raw so each game (game_id) is one row
+train <- train_raw %>%
+  group_by(game_id) %>%
+  summarize(
+    team_home  = team[home_away == "home"],
+    team_away  = team[home_away == "away"],
+    score_home = team_score[home_away == "home"],
+    score_away = opponent_team_score[home_away == "home"],
+    home_win   = if_else(team_score[home_away == "home"] > opponent_team_score[home_away == "home"], 1, 0),
+    
+    FG2_percentage_home = mean(FGM_2[home_away == "home"] / FGA_2[home_away == "home"], na.rm = TRUE),
+    FG2_percentage_away = mean(FGM_2[home_away == "away"] / FGA_2[home_away == "away"], na.rm = TRUE),
+    FG3_percentage_home = mean(FGM_3[home_away == "home"] / FGA_3[home_away == "home"], na.rm = TRUE),
+    FG3_percentage_away = mean(FGM_3[home_away == "away"] / FGA_3[home_away == "away"], na.rm = TRUE),
+    FT_percentage_home  = mean(FTM[home_away == "home"] / FTA[home_away == "home"], na.rm = TRUE),
+    FT_percentage_away  = mean(FTM[home_away == "away"] / FTA[home_away == "away"], na.rm = TRUE),
+    
+    AST_home = mean(AST[home_away == "home"], na.rm = TRUE),
+    AST_away = mean(AST[home_away == "away"], na.rm = TRUE),
+    BLK_home = mean(BLK[home_away == "home"], na.rm = TRUE),
+    BLK_away = mean(BLK[home_away == "away"], na.rm = TRUE),
+    STL_home = mean(STL[home_away == "home"], na.rm = TRUE),
+    STL_away = mean(STL[home_away == "away"], na.rm = TRUE),
+    TOV_home = mean(TOV[home_away == "home"], na.rm = TRUE),
+    TOV_away = mean(TOV[home_away == "away"], na.rm = TRUE),
+    DREB_home = mean(DREB[home_away == "home"], na.rm = TRUE),
+    DREB_away = mean(DREB[home_away == "away"], na.rm = TRUE),
+    OREB_home = mean(OREB[home_away == "home"], na.rm = TRUE),
+    OREB_away = mean(OREB[home_away == "away"], na.rm = TRUE),
+    
+    home_away_NS     = first(home_away_NS[home_away == "home"]),
+    rest_days_home   = first(rest_days[home_away == "home"]),
+    rest_days_away   = first(rest_days[home_away == "away"]),
+    travel_dist_home = first(travel_dist[home_away == "home"]),
+    travel_dist_away = first(travel_dist[home_away == "away"]),
+    
+    notD1_incomplete_home = any(notD1_incomplete[home_away == "home"]),
+    notD1_incomplete_away = any(notD1_incomplete[home_away == "away"]),
+    .groups = "drop"
   )
 
-# Machine Learning
+cat("\nAggregated train data sample:\n")
+print(head(train))
 
-# For training data:
-train_features <- merged_games %>%
-  # Convert logicals (and any factors) to numeric if necessary
-  mutate(across(c(notD1_incomplete_home, notD1_incomplete_away), ~ as.numeric(.)),
-         home_away_NS = as.numeric(home_away_NS)) %>%
-  # Remove the target variable from features
-  dplyr::select(-home_win)
+###############################################################################
+# 3) Run the WHR to Compute Team Ratings
+###############################################################################
+# Example margin function
+my_margin_func <- function(row) {
+  diff_abs <- abs(row$score_home - row$score_away)
+  1 + log(1 + diff_abs)
+}
 
-# Convert to matrix (xgboost expects a numeric matrix)
-train_matrix <- as.matrix(train_features)
-
-# Extract the target variable
-train_label <- merged_games$home_win
-
-# Create the xgboost DMatrix for training
-dtrain <- xgb.DMatrix(data = train_matrix, label = train_label)
-
-# For test data:
-test_features <- test %>%
-  mutate(across(c(notD1_incomplete_home, notD1_incomplete_away), ~ as.numeric(.)),
-         home_away_NS = as.numeric(home_away_NS))
-
-test_matrix <- as.matrix(test_features)
-dtest <- xgb.DMatrix(data = test_matrix)
-
-# Define the parameters for XGBoost
-params <- list(
-  objective = "binary:logistic",  # binary classification
-  eval_metric = "auc",            # evaluation metric: Area Under the Curve
-  max_depth = 6,                  # maximum depth of trees
-  eta = 0.1,                      # learning rate
-  subsample = 0.8,                # subsample ratio of the training instance
-  colsample_bytree = 0.8          # subsample ratio of columns when constructing each tree
-)
-
-# ------------------------------------------------------------------
-# First: Use xgb.cv to determine the best number of boosting rounds
-cv_results <- xgb.cv(
-  params = params,
-  data = dtrain,
-  nrounds = 100,              # maximum number of boosting rounds
-  nfold = 5,                  # 5-fold cross-validation
-  early_stopping_rounds = 10, # stop if no improvement for 10 rounds
-  verbose = 1
-)
-
-# Retrieve the best number of rounds from cross-validation
-best_nrounds <- cv_results$best_iteration
-cat("Best number of rounds from xgb.cv:", best_nrounds, "\n")
-
-# ------------------------------------------------------------------
-# Next: Manual 5-Fold Cross-Validation to report confusion matrices
 set.seed(123)
-folds <- createFolds(train_label, k = 5, list = TRUE, returnTrain = FALSE)
-# This vector will hold the out-of-fold predictions for an overall validation performance
-val_preds_all <- rep(NA, length(train_label))
-
-cat("\nManual Cross-Validation Results:\n")
-for (fold in seq_along(folds)) {
-  cat(sprintf("\n--- Fold %d ---\n", fold))
-  val_idx <- folds[[fold]]
-  train_idx <- setdiff(seq_along(train_label), val_idx)
-  
-  # Create fold-specific DMatrix objects
-  dtrain_fold <- xgb.DMatrix(data = train_matrix[train_idx, ], label = train_label[train_idx])
-  dval_fold   <- xgb.DMatrix(data = train_matrix[val_idx, ], label = train_label[val_idx])
-  
-  watchlist <- list(train = dtrain_fold, eval = dval_fold)
-  
-  # Train on the current fold using best_nrounds from xgb.cv
-  model_fold <- xgb.train(
-    params = params,
-    data = dtrain_fold,
-    nrounds = best_nrounds,
-    watchlist = watchlist,
-    verbose = 0
-  )
-  
-  # Predict on training fold and validation fold
-  train_pred_prob <- predict(model_fold, dtrain_fold)
-  val_pred_prob   <- predict(model_fold, dval_fold)
-  
-  # Convert probabilities to binary classes (threshold = 0.5)
-  train_pred_class <- ifelse(train_pred_prob > 0.5, 1, 0)
-  val_pred_class   <- ifelse(val_pred_prob > 0.5, 1, 0)
-  
-  # Compute and print confusion matrices
-  cm_train <- confusionMatrix(as.factor(train_pred_class), as.factor(train_label[train_idx]))
-  cm_val   <- confusionMatrix(as.factor(val_pred_class), as.factor(train_label[val_idx]))
-  
-  cat("Training Confusion Matrix:\n")
-  print(cm_train)
-  
-  cat("Validation Confusion Matrix:\n")
-  print(cm_val)
-  
-  # Store out-of-fold validation predictions
-  val_preds_all[val_idx] <- val_pred_prob
-}
-
-# Overall Validation Performance (aggregated across folds)
-overall_val_class <- ifelse(val_preds_all > 0.5, 1, 0)
-overall_cm <- confusionMatrix(as.factor(overall_val_class), as.factor(train_label))
-cat("\nOverall Validation Confusion Matrix (aggregated across folds):\n")
-print(overall_cm)
-
-# ------------------------------------------------------------------
-# Now, train the final model on the full training data using best_nrounds
-final_model <- xgb.train(
-  params = params,
-  data = dtrain,
-  nrounds = best_nrounds,
-  verbose = 1
+whr_ratings <- run_whole_history_rating(
+  df_games             = train,
+  init_rating          = 1500,
+  k                    = 20,
+  home_field_advantage = 32,
+  c                    = 0.01,
+  margin_func          = my_margin_func,
+  max_iter             = 50,
+  tol                  = 0.0005
 )
 
-# Predict on the full training set (this is in-sample; it may be overoptimistic)
-train_predictions <- predict(final_model, dtrain)
-train_predicted_classes <- ifelse(train_predictions > 0.5, 1, 0)
-conf_matrix <- confusionMatrix(as.factor(train_predicted_classes), as.factor(train_label))
-cat("\nConfusion Matrix on Full Training Data (Final Model):\n")
-print(conf_matrix)
+cat("\nSample of final WHR ratings:\n")
+print(head(whr_ratings))
 
-# ------------------------------------------------------------------
-# Predict on the test set using the full model
-predictions <- predict(final_model, dtest)
-predicted_classes <- ifelse(predictions > 0.5, 1, 0)
+###############################################################################
+# 4) Feature Engineering for Training Data
+###############################################################################
+train_fe <- train %>%
+  mutate(
+    rating_home = whr_ratings[team_home],
+    rating_away = whr_ratings[team_away],
+    diff_rating = rating_home - rating_away,
+    
+    diff_FG2 = FG2_percentage_home - FG2_percentage_away,
+    diff_FG3 = FG3_percentage_home - FG3_percentage_away,
+    diff_FT  = FT_percentage_home - FT_percentage_away,
+    
+    ratio_AST = AST_home / pmax(AST_away, 1),
+    ratio_BLK = BLK_home / pmax(BLK_away, 1),
+    ratio_STL = STL_home / pmax(STL_away, 1),
+    ratio_REB = (DREB_home + OREB_home) / pmax(DREB_away + OREB_away, 1),
+    
+    off_eff_home = (score_home / (TOV_home + 1)) * (1 + AST_home / 100),
+    off_eff_away = (score_away / (TOV_away + 1)) * (1 + AST_away / 100),
+    def_eff_home = (BLK_home + STL_home) / pmax(TOV_home, 1),
+    def_eff_away = (BLK_away + STL_away) / pmax(TOV_away, 1)
+  ) %>%
+  mutate(
+    across(c(notD1_incomplete_home, notD1_incomplete_away), as.numeric),
+    home_away_NS = as.numeric(home_away_NS)
+  )
 
-# View the first few predictions
-cat("\nTest Set Predicted Probabilities:\n")
-print((predictions))
-cat("\nTest Set Predicted Classes:\n")
-print((predicted_classes))
+train_features <- train_fe %>%
+  select(
+    rating_home, rating_away, diff_rating,
+    FG2_percentage_home, FG2_percentage_away, diff_FG2,
+    FG3_percentage_home, FG3_percentage_away, diff_FG3,
+    FT_percentage_home, FT_percentage_away, diff_FT,
+    ratio_AST, ratio_BLK, ratio_STL, ratio_REB,
+    off_eff_home, off_eff_away, def_eff_home, def_eff_away,
+    home_away_NS, rest_days_home, rest_days_away,
+    travel_dist_home, travel_dist_away,
+    notD1_incomplete_home, notD1_incomplete_away
+  )
 
-# ------------------------------------------------------------------
-# Feature Importance
-feature_names <- colnames(train_matrix)
-importance_matrix <- xgb.importance(feature_names, model = final_model)
-print(importance_matrix)
-xgb.plot.importance(importance_matrix)
+# Create a target factor with valid names ("Loss" and "Win")
+train_label <- factor(train_fe$home_win, levels = c(0,1), labels = c("Loss", "Win"))
+
+# Combine features and label, and remove rows with missing values
+train_model_df <- data.frame(train_features, home_win = train_label)
+train_model_df <- na.omit(train_model_df)
+
+cat("\nTraining data dimensions after omitting NAs:\n")
+print(dim(train_model_df))
+
+###############################################################################
+# 5) Split Data (80/20) and Train XGBoost (via caret with method = 'xgbTree')
+###############################################################################
+set.seed(123)
+trainIndex <- createDataPartition(train_model_df$home_win, p = 0.8, list = FALSE)
+train_split <- train_model_df[trainIndex, ]
+valid_split <- train_model_df[-trainIndex, ]
+
+# caret control
+train_control <- trainControl(
+  method          = "cv",
+  number          = 5,
+  classProbs      = TRUE,
+  savePredictions = "final",
+  verboseIter     = FALSE
+)
+
+# Grid for xgboost ("xgbTree")
+# Feel free to change these values as needed
+xgb_grid <- expand.grid(
+  nrounds          = c(100, 200),
+  max_depth        = c(3, 6),
+  eta              = c(0.01, 0.05),
+  gamma            = c(0, 1),
+  colsample_bytree = c(0.8, 1.0),
+  min_child_weight = c(1, 5),
+  subsample        = c(0.8, 1.0)
+)
+
+set.seed(123)
+xgb_tuned <- train(
+  home_win ~ .,
+  data      = train_split,
+  method    = "xgbTree",
+  metric    = "Accuracy",
+  trControl = train_control,
+  tuneGrid  = xgb_grid
+)
+
+cat("\nBest Tuning Parameters:\n")
+print(xgb_tuned$bestTune)
+
+cat("\nTraining Results:\n")
+print(xgb_tuned)
+
+# Predict on the training split
+train_pred_class <- predict(xgb_tuned, newdata = train_split, type = "raw")
+train_cm <- confusionMatrix(train_pred_class, train_split$home_win)
+cat("\nTraining Accuracy:", round(train_cm$overall["Accuracy"] * 100, 2), "%\n")
+
+# Predict on the validation split
+valid_pred_class <- predict(xgb_tuned, newdata = valid_split, type = "raw")
+valid_cm <- confusionMatrix(valid_pred_class, valid_split$home_win)
+cat("\nValidation Accuracy:", round(valid_cm$overall["Accuracy"] * 100, 2), "%\n")
+
+###############################################################################
+# 6) Prepare Test Data (Same Aggregation and Feature Engineering)
+###############################################################################
+test <- test_raw %>%
+  group_by(game_id) %>%
+  summarize(
+    team_home  = team[home_away == "home"],
+    team_away  = team[home_away == "away"],
+    score_home = team_score[home_away == "home"],
+    score_away = opponent_team_score[home_away == "home"],
+    
+    FG2_percentage_home = mean(FGM_2[home_away == "home"] / FGA_2[home_away == "home"], na.rm = TRUE),
+    FG2_percentage_away = mean(FGM_2[home_away == "away"] / FGA_2[home_away == "away"], na.rm = TRUE),
+    FG3_percentage_home = mean(FGM_3[home_away == "home"] / FGA_3[home_away == "home"], na.rm = TRUE),
+    FG3_percentage_away = mean(FGM_3[home_away == "away"] / FGA_3[home_away == "away"], na.rm = TRUE),
+    FT_percentage_home  = mean(FTM[home_away == "home"] / FTA[home_away == "home"], na.rm = TRUE),
+    FT_percentage_away  = mean(FTM[home_away == "away"] / FTA[home_away == "away"], na.rm = TRUE),
+    
+    AST_home = mean(AST[home_away == "home"], na.rm = TRUE),
+    AST_away = mean(AST[home_away == "away"], na.rm = TRUE),
+    BLK_home = mean(BLK[home_away == "home"], na.rm = TRUE),
+    BLK_away = mean(BLK[home_away == "away"], na.rm = TRUE),
+    STL_home = mean(STL[home_away == "home"], na.rm = TRUE),
+    STL_away = mean(STL[home_away == "away"], na.rm = TRUE),
+    TOV_home = mean(TOV[home_away == "home"], na.rm = TRUE),
+    TOV_away = mean(TOV[home_away == "away"], na.rm = TRUE),
+    DREB_home = mean(DREB[home_away == "home"], na.rm = TRUE),
+    DREB_away = mean(DREB[home_away == "away"], na.rm = TRUE),
+    OREB_home = mean(OREB[home_away == "home"], na.rm = TRUE),
+    OREB_away = mean(OREB[home_away == "away"], na.rm = TRUE),
+    
+    home_away_NS     = first(home_away_NS[home_away == "home"]),
+    rest_days_home   = first(rest_days[home_away == "home"]),
+    rest_days_away   = first(rest_days[home_away == "away"]),
+    travel_dist_home = first(travel_dist[home_away == "home"]),
+    travel_dist_away = first(travel_dist[home_away == "away"]),
+    
+    notD1_incomplete_home = any(notD1_incomplete[home_away == "home"]),
+    notD1_incomplete_away = any(notD1_incomplete[home_away == "away"]),
+    .groups = "drop"
+  )
+
+test_fe <- test %>%
+  mutate(
+    rating_home = whr_ratings[team_home],
+    rating_away = whr_ratings[team_away],
+    diff_rating = rating_home - rating_away,
+    
+    diff_FG2 = FG2_percentage_home - FG2_percentage_away,
+    diff_FG3 = FG3_percentage_home - FG3_percentage_away,
+    diff_FT  = FT_percentage_home - FT_percentage_away,
+    
+    ratio_AST = AST_home / pmax(AST_away, 1),
+    ratio_BLK = BLK_home / pmax(BLK_away, 1),
+    ratio_STL = STL_home / pmax(STL_away, 1),
+    ratio_REB = (DREB_home + OREB_home) / pmax(DREB_away + OREB_away, 1),
+    
+    off_eff_home = (score_home / (TOV_home + 1)) * (1 + AST_home/100),
+    off_eff_away = (score_away / (TOV_away + 1)) * (1 + AST_away/100),
+    def_eff_home = (BLK_home + STL_home) / pmax(TOV_home, 1),
+    def_eff_away = (BLK_away + STL_away) / pmax(TOV_away, 1)
+  ) %>%
+  mutate(
+    across(c(notD1_incomplete_home, notD1_incomplete_away), as.numeric),
+    home_away_NS = as.numeric(home_away_NS)
+  )
+
+test_features <- test_fe %>% select(names(train_features))
+
+cat("\nTest data after feature engineering:\n")
+print(head(test_features))
+
+###############################################################################
+# 7) Predict on Test Data (Using XGBoost model)
+###############################################################################
+test_pred_class <- predict(xgb_tuned, newdata = test_features, type = "raw")
+test_pred_prob  <- predict(xgb_tuned, newdata = test_features, type = "prob")
+
+test_results <- test_fe %>%
+  mutate(
+    predicted_class_home_win = test_pred_class,
+    predicted_prob_home_win  = test_pred_prob[,"Win"]
+  )
+
+cat("\nFinal Test Predictions:\n")
+print(
+  test_results %>% 
+    select(team_home, team_away, score_home, score_away, 
+           predicted_class_home_win, predicted_prob_home_win)
+)
+
+cat("\nSCRIPT COMPLETE.\n")
