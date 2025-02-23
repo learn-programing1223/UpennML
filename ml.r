@@ -5,15 +5,13 @@ library(tidyverse)
 library(caret)
 library(xgboost)
 
-# Set seed for reproducibility
-# set.seed(123)
+set.seed(123)
 
-# Define file paths (adjust these paths as needed)
+# Define file paths (adjust as needed)
 train_raw_path <- "games_2022.csv"
 test_raw_path  <- "East Regional Games to predict.csv"
 
-# Read training and test files.
-# We use check.names=TRUE to ensure valid R names.
+# Read data (ensuring valid R column names)
 train_raw <- read.csv(train_raw_path, stringsAsFactors = FALSE, check.names = TRUE)
 test_raw  <- read.csv(test_raw_path, stringsAsFactors = FALSE, check.names = TRUE)
 
@@ -46,12 +44,12 @@ whr_pass <- function(ratings, df_games, k, home_field_advantage, c, margin_func 
     old_rh <- ratings[home_team]
     old_ra <- ratings[away_team]
     updated <- update_ratings_for_game(
-      rh = old_rh, 
-      ra = old_ra, 
+      rh = old_rh,
+      ra = old_ra,
       outcome_home = outcome_home,
-      k = k, 
-      home_field_advantage = home_field_advantage, 
-      c = c, 
+      k = k,
+      home_field_advantage = home_field_advantage,
+      c = c,
       margin_of_victory = margin_val
     )
     ratings[home_team] <- updated$rh
@@ -77,7 +75,7 @@ run_whole_history_rating <- function(df_games,
     ratings <- whr_pass(ratings, df_games, k, home_field_advantage, c, margin_func)
     avg_change <- mean(abs(ratings - old_ratings), na.rm = TRUE)
     cat(sprintf("Iteration %d: avg rating change = %.4f\n", iter, avg_change))
-    if (!is.na(avg_change) && avg_change < tol) {
+    if (avg_change < tol) {
       cat(sprintf("Converged at iteration %d\n", iter))
       break
     }
@@ -88,12 +86,6 @@ run_whole_history_rating <- function(df_games,
 ###############################################################################
 # 2) Process and Aggregate the Training Data
 ###############################################################################
-# (Assume training data from games_2022.csv contains the following headers:
-#  game_id, game_date, team, FGA_2, FGM_2, FGA_3, FGM_3, FTA, FTM, AST, BLK, STL, 
-#  TOV, TOV_team, DREB, OREB, F_tech, F_personal, team_score, opponent_team_score,
-#  largest_lead, notD1_incomplete, OT_length_min_tot, rest_days, attendance, tz_dif_H_E,
-#  prev_game_dist, home_away, home_away_NS, travel_dist)
-
 # Remove rows missing team identifier
 train_raw <- train_raw %>% filter(!is.na(team))
 
@@ -141,9 +133,8 @@ cat("\nAggregated train data sample:\n")
 print(head(train))
 
 ###############################################################################
-# 2a) Build Team-Level Averages for Imputation (from train_raw)
+# 2a) Build Team-Level Averages for Imputation (for missing advanced stats)
 ###############################################################################
-# Compute team averages for shooting and other stats, and also a flag for notD1_incomplete
 team_stats <- train_raw %>%
   group_by(team) %>%
   summarize(
@@ -159,24 +150,39 @@ team_stats <- train_raw %>%
     notD1 = as.numeric(any(notD1_incomplete))
   ) %>% ungroup()
 
+# Compute team-level efficiency averages from aggregated training games
+team_eff_home <- train %>%
+  group_by(team_home) %>%
+  summarize(
+    off_eff_home = mean(score_home / (TOV_home + 1) * (1 + AST_home / 100), na.rm = TRUE),
+    def_eff_home = mean((BLK_home + STL_home) / pmax(TOV_home, 1), na.rm = TRUE)
+  ) %>% ungroup() %>% rename(team = team_home)
+
+team_eff_away <- train %>%
+  group_by(team_away) %>%
+  summarize(
+    off_eff_away = mean(score_away / (TOV_away + 1) * (1 + AST_away / 100), na.rm = TRUE),
+    def_eff_away = mean((BLK_away + STL_away) / pmax(TOV_away, 1), na.rm = TRUE)
+  ) %>% ungroup() %>% rename(team = team_away)
+
 ###############################################################################
 # 3) Compute WHR (Team Ratings) on Training Data
 ###############################################################################
-# Define a margin function using the point differential
 my_margin_func <- function(row) {
   diff_abs <- abs(row$score_home - row$score_away)
   1 + log(1 + diff_abs)
 }
 
+set.seed(123)
 whr_ratings <- run_whole_history_rating(
-  df_games             = train,
-  init_rating          = 1500,
-  k                    = 20,
+  df_games = train,
+  init_rating = 1500,
+  k = 20,
   home_field_advantage = 32,
-  c                    = 0.01,
-  margin_func          = my_margin_func,
-  max_iter             = 50,
-  tol                  = 0.0005
+  c = 0.01,
+  margin_func = my_margin_func,
+  max_iter = 50,
+  tol = 0.0005
 )
 
 cat("\nSample of final WHR ratings:\n")
@@ -198,22 +204,29 @@ train_fe <- train %>%
     ratio_AST = AST_home / pmax(AST_away, 1),
     ratio_BLK = BLK_home / pmax(BLK_away, 1),
     ratio_STL = STL_home / pmax(STL_away, 1),
-    ratio_REB = (DREB_home + OREB_home) / pmax(DREB_away + OREB_away, 1),
-    
+    ratio_REB = (DREB_home + OREB_home) / pmax(DREB_away + OREB_away, 1)
+  ) %>%
+  # Compute efficiency features using actual game data
+  mutate(
+    off_eff_home = (score_home / (TOV_home + 1)) * (1 + AST_home / 100),
+    off_eff_away = (score_away / (TOV_away + 1)) * (1 + AST_away / 100),
+    def_eff_home = (BLK_home + STL_home) / pmax(TOV_home, 1),
+    def_eff_away = (BLK_away + STL_away) / pmax(TOV_away, 1)
+  ) %>%
+  mutate(
+    across(c(notD1_incomplete_home, notD1_incomplete_away), as.numeric),
     home_away_NS = as.numeric(home_away_NS)
   )
 
-# Select features (the training model was built on these 34 columns)
+# Select training features (34 columns)
 train_features <- train_fe %>%
   select(
     rating_home, rating_away, diff_rating,
     FG2_percentage_home, FG2_percentage_away, diff_FG2,
     FG3_percentage_home, FG3_percentage_away, diff_FG3,
     FT_percentage_home, FT_percentage_away, diff_FT,
-    AST_home, AST_away, ratio_AST,
-    BLK_home, BLK_away, ratio_BLK,
-    STL_home, STL_away, ratio_STL,
-    DREB_home, DREB_away, OREB_home, OREB_away, ratio_REB,
+    ratio_AST, ratio_BLK, ratio_STL, ratio_REB,
+    off_eff_home, off_eff_away, def_eff_home, def_eff_away,
     home_away_NS, rest_days_home, rest_days_away,
     travel_dist_home, travel_dist_away,
     notD1_incomplete_home, notD1_incomplete_away
@@ -228,7 +241,7 @@ print(dim(train_model_df))
 ###############################################################################
 # 5) Split Data and Train XGBoost Model (via caret)
 ###############################################################################
-# set.seed(123)
+set.seed(123)
 trainIndex <- createDataPartition(train_model_df$home_win, p = 0.8, list = FALSE)
 train_split <- train_model_df[trainIndex, ]
 valid_split <- train_model_df[-trainIndex, ]
@@ -241,17 +254,18 @@ train_control <- trainControl(
   verboseIter = FALSE
 )
 
-# Use a tuning grid based on your previous high–accuracy run
+# Use a tuning grid that previously yielded high accuracy
 xgb_grid <- expand.grid(
-  nrounds = 200,
-  max_depth = 6,
-  eta = 0.05,
-  gamma = 1,
-  colsample_bytree = 1,
-  min_child_weight = 5,
-  subsample = 0.8
+  nrounds = c(100, 200),
+  max_depth = c(3, 6),
+  eta = c(0.01, 0.05),
+  gamma = c(0, 1),
+  colsample_bytree = c(0.8, 1.0),
+  min_child_weight = c(1, 5),
+  subsample = c(0.8, 1.0)
 )
 
+set.seed(123)
 xgb_tuned <- train(
   home_win ~ .,
   data = train_split,
@@ -267,7 +281,7 @@ print(xgb_tuned$bestTune)
 cat("\nTraining Results:\n")
 print(xgb_tuned)
 
-# Evaluate on training and validation splits
+# Evaluate performance on training and validation splits
 train_pred_class <- predict(xgb_tuned, newdata = train_split, type = "raw")
 train_cm <- confusionMatrix(train_pred_class, train_split$home_win)
 cat("\nTraining Accuracy:", round(train_cm$overall["Accuracy"] * 100, 2), "%\n")
@@ -279,10 +293,10 @@ cat("\nValidation Accuracy:", round(valid_cm$overall["Accuracy"] * 100, 2), "%\n
 ###############################################################################
 # 6) Prepare Test Data – Feature Engineering and Imputation
 ###############################################################################
-# The test file (East Regional Games to predict.csv) has different columns.
-# It contains: game_id, description, team_home, team_away, seed_home, seed_away, 
-# home_away_NS, rest_days_Home, rest_days_Away, travel_dist_Home, travel_dist_Away, WINNING. 
-# We first rename columns to match our training names:
+# The test file ("East Regional Games to predict.csv") has different columns:
+# game_id, description, team_home, team_away, seed_home, seed_away,
+# home_away_NS, rest_days_Home, rest_days_Away, travel_dist_Home, travel_dist_Away, WINNING_%
+# First, rename columns to match our training names.
 test <- test_raw %>%
   rename(
     rest_days_home = rest_days_Home,
@@ -291,19 +305,15 @@ test <- test_raw %>%
     travel_dist_away = travel_dist_Away
   )
 
-# For test, many of the advanced shooting/passing stats are missing.
-# We impute them by joining in team-level averages computed from training.
-# (This join is performed separately for the home and away teams.)
+# For test data, advanced shooting stats and game scores are not available.
+# We impute missing shooting stats by joining team_stats (for FG2, FG3, FT, etc.)
 test_fe <- test %>%
-  # Join team stats for the home team
   left_join(team_stats, by = c("team_home" = "team")) %>%
   rename_at(vars(FG2_pct, FG3_pct, FT_pct, AST_avg, BLK_avg, STL_avg, TOV_avg, DREB_avg, OREB_avg, notD1),
             ~ paste0(., "_home")) %>%
-  # Join team stats for the away team
   left_join(team_stats, by = c("team_away" = "team")) %>%
   rename_at(vars(FG2_pct, FG3_pct, FT_pct, AST_avg, BLK_avg, STL_avg, TOV_avg, DREB_avg, OREB_avg, notD1),
             ~ paste0(., "_away")) %>%
-  # Rename joined columns to match training feature names
   rename(
     FG2_percentage_home = FG2_pct_home,
     FG3_percentage_home = FG3_pct_home,
@@ -337,7 +347,7 @@ test_fe <- test %>%
     ratio_STL = STL_home / pmax(STL_away, 1),
     ratio_REB = (DREB_home + OREB_home) / pmax(DREB_away + OREB_away, 1)
   ) %>%
-  # Add WHR ratings (from training) and compute rating difference
+  # Impute WHR ratings using the training WHR values
   mutate(
     rating_home = whr_ratings[team_home],
     rating_away = whr_ratings[team_away],
@@ -345,17 +355,22 @@ test_fe <- test %>%
     home_away_NS = as.numeric(home_away_NS)
   )
 
-# Define test_features as the same set of columns as in training
+# Impute efficiency features for test data using team-level averages computed on training:
+# Join the precomputed team efficiencies for home and away.
+test_fe <- test_fe %>%
+  left_join(team_eff_home, by = c("team_home" = "team")) %>%
+  left_join(team_eff_away, by = c("team_away" = "team"))
+
+# For test games, we now have off_eff_home, def_eff_home, off_eff_away, def_eff_away imputed.
+# Define test_features using the same columns as used in training.
 test_features <- test_fe %>%
   select(
     rating_home, rating_away, diff_rating,
     FG2_percentage_home, FG2_percentage_away, diff_FG2,
     FG3_percentage_home, FG3_percentage_away, diff_FG3,
     FT_percentage_home, FT_percentage_away, diff_FT,
-    AST_home, AST_away, ratio_AST,
-    BLK_home, BLK_away, ratio_BLK,
-    STL_home, STL_away, ratio_STL,
-    DREB_home, DREB_away, OREB_home, OREB_away, ratio_REB,
+    ratio_AST, ratio_BLK, ratio_STL, ratio_REB,
+    off_eff_home, off_eff_away, def_eff_home, def_eff_away,
     home_away_NS, rest_days_home, rest_days_away,
     travel_dist_home, travel_dist_away,
     notD1_incomplete_home, notD1_incomplete_away
