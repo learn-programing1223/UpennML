@@ -1,5 +1,5 @@
 ###############################################################################
-# Integrated Model Training & Overfitting/Calibration Validation Script
+# Final Integrated Code: Model Training, Validation, & Unseeded Region Seeding
 ###############################################################################
 
 # 0) Libraries, Seed, and Data Reading
@@ -102,7 +102,8 @@ train <- train_raw %>%
     team_away  = first(team[home_away == "away"]),
     score_home = first(team_score[home_away == "home"]),
     score_away = first(opponent_team_score[home_away == "home"]),
-    home_win   = if_else(first(team_score[home_away == "home"]) > first(opponent_team_score[home_away == "home"]), 1, 0),
+    home_win   = if_else(first(team_score[home_away == "home"]) > 
+                           first(opponent_team_score[home_away == "home"]), 1, 0),
     
     FG2_percentage_home = mean(FGM_2[home_away == "home"] / FGA_2[home_away == "home"], na.rm = TRUE),
     FG2_percentage_away = mean(FGM_2[home_away == "away"] / FGA_2[home_away == "away"], na.rm = TRUE),
@@ -186,9 +187,9 @@ print(head(whr_ratings))
 # Join team_stats (for efficiency metrics) for both home and away teams
 train_fe <- train %>% 
   left_join(team_stats %>% select(team, off_eff_avg, def_eff_avg), by = c("team_home" = "team")) %>%
-  rename(off_eff_home = off_eff_avg, def_eff_home = def_eff_avg) %>%
-  left_join(team_stats %>% select(team, off_eff_avg, def_eff_avg), by = c("team_away" = "team")) %>%
-  rename(off_eff_away = off_eff_avg, def_eff_away = def_eff_avg) %>%
+  rename(off_eff_home = off_eff_avg, def_eff_home = def_eff_avg) %>% 
+  left_join(team_stats %>% select(team, off_eff_avg, def_eff_avg), by = c("team_away" = "team")) %>% 
+  rename(off_eff_away = off_eff_avg, def_eff_away = def_eff_avg) %>% 
   mutate(
     rating_home = whr_ratings[team_home],
     rating_away = whr_ratings[team_away],
@@ -229,7 +230,7 @@ print(dim(train_model_df))
 ###############################################################################
 # 5) Split Data and Tune XGBoost via Bayesian Optimization
 ###############################################################################
-# Create design matrix and DMatrix
+# Create design matrix and DMatrix for tuning
 train_matrix <- model.matrix(home_win ~ . - 1, data = train_model_df)
 train_label_num <- ifelse(train_model_df$home_win == "Win", 1, 0)
 dtrain <- xgb.DMatrix(data = train_matrix, label = train_label_num)
@@ -256,7 +257,7 @@ opt_func <- function(max_depth, min_child_weight, subsample, colsample_bytree, e
                verbose = 0,
                early_stopping_rounds = 10)
   best_error <- min(cv$evaluation_log$test_error_mean)
-  # We maximize negative error (accuracy = 1 - error)
+  # Maximize negative error (accuracy = 1 - error)
   list(Score = -best_error, Pred = cv$evaluation_log$test_error_mean)
 }
 
@@ -302,7 +303,7 @@ xgb_final <- xgb.train(
   verbose = 0
 )
 
-# Evaluate final model with caret split
+# Evaluate final model on a caret split
 set.seed(123)
 trainIndex <- createDataPartition(train_model_df$home_win, p = 0.8, list = FALSE)
 train_split <- train_model_df[trainIndex, ]
@@ -329,7 +330,7 @@ cat("\nFinal Validation Accuracy:", round(valid_cm$overall["Accuracy"] * 100, 2)
 ###############################################################################
 # 6) Prepare Test Data – Feature Engineering and Imputation
 ###############################################################################
-test <- test_raw %>%
+test <- test_raw %>% 
   rename(
     rest_days_home = rest_days_Home,
     rest_days_away = rest_days_Away,
@@ -337,9 +338,10 @@ test <- test_raw %>%
     travel_dist_away = travel_dist_Away
   )
 
-test_fe <- test %>%
-  left_join(team_stats %>% select(team, FG2_pct, FG3_pct, FT_pct, AST_avg, BLK_avg, STL_avg, TOV_avg, DREB_avg, OREB_avg, notD1, off_eff_avg, def_eff_avg),
-            by = c("team_home" = "team")) %>%
+test_fe <- test %>% 
+  left_join(team_stats %>% select(team, FG2_pct, FG3_pct, FT_pct, AST_avg, BLK_avg, STL_avg,
+                                  TOV_avg, DREB_avg, OREB_avg, notD1, off_eff_avg, def_eff_avg),
+            by = c("team_home" = "team")) %>% 
   rename(
     FG2_percentage_home = FG2_pct,
     FG3_percentage_home = FG3_pct,
@@ -353,9 +355,10 @@ test_fe <- test %>%
     notD1_incomplete_home = notD1,
     off_eff_home = off_eff_avg,
     def_eff_home = def_eff_avg
-  ) %>%
-  left_join(team_stats %>% select(team, FG2_pct, FG3_pct, FT_pct, AST_avg, BLK_avg, STL_avg, TOV_avg, DREB_avg, OREB_avg, notD1, off_eff_avg, def_eff_avg),
-            by = c("team_away" = "team")) %>%
+  ) %>% 
+  left_join(team_stats %>% select(team, FG2_pct, FG3_pct, FT_pct, AST_avg, BLK_avg, STL_avg,
+                                  TOV_avg, DREB_avg, OREB_avg, notD1, off_eff_avg, def_eff_avg),
+            by = c("team_away" = "team")) %>% 
   rename(
     FG2_percentage_away = FG2_pct,
     FG3_percentage_away = FG3_pct,
@@ -369,7 +372,7 @@ test_fe <- test %>%
     notD1_incomplete_away = notD1,
     off_eff_away = off_eff_avg,
     def_eff_away = def_eff_avg
-  ) %>%
+  ) %>% 
   mutate(
     diff_FG2 = FG2_percentage_home - FG2_percentage_away,
     diff_FG3 = FG3_percentage_home - FG3_percentage_away,
@@ -406,7 +409,7 @@ print(head(test_features))
 test_pred_prob <- predict(xgb_final, newdata = xgb.DMatrix(data = model.matrix(~ . - 1, data = test_features)))
 test_pred_class <- factor(ifelse(test_pred_prob > 0.5, "Win", "Loss"), levels = c("Loss", "Win"))
 
-test_results <- test_fe %>%
+test_results <- test_fe %>% 
   mutate(
     predicted_class_home_win = test_pred_class,
     predicted_prob_home_win = test_pred_prob
@@ -583,7 +586,7 @@ generate_learning_curves <- function(train_model_df, train_sizes = seq(0.1, 0.9,
   learning_curve_data
 }
 
-## 8c) Reliability Diagram and Brier Score
+## 8c) Reliability Diagram and Brier Score Functions
 create_reliability_diagram <- function(predictions, actual_outcomes, n_bins = 10) {
   bin_breaks <- seq(0, 1, length.out = n_bins + 1)
   binned_preds <- cut(predictions, breaks = bin_breaks, include.lowest = TRUE)
@@ -609,7 +612,6 @@ create_reliability_diagram <- function(predictions, actual_outcomes, n_bins = 10
       ))
     }
   }
-  
   reliability_data
 }
 
@@ -617,7 +619,7 @@ calculate_brier_score <- function(predictions, actual_outcomes) {
   mean((predictions - actual_outcomes)^2)
 }
 
-## 8d) Validation Function to run all checks
+## 8d) Validation Function to Run All Checks
 validate_model <- function(train_model_df, final_model, test_data, final_params) {
   cat("Running cross-validation analysis...\n")
   cv_results <- run_cv_analysis(train_model_df, k = 5)
@@ -711,9 +713,183 @@ plot_validation_results <- function(results) {
 }
 
 ###############################################################################
-# 8) Run Model Validation Analysis
+# 9) Run Model Validation Analysis
 ###############################################################################
 validation_results <- validate_model(train_model_df, xgb_final, test_fe, final_params)
 plots <- plot_validation_results(validation_results)
-
 cat("\nValidation analysis complete.\n")
+
+###############################################################################
+# 10) Unseeded Region Seeding: Assign seeds to regions (other than East)
+###############################################################################
+# Define a team-region mapping (for all regions except East; East teams are assumed seeded)
+team_regions <- tribble(
+  ~team, ~region,
+  # North Region teams
+  "alabama_crimson_tide", "North",
+  "alabama_state_lady_hornets", "North",
+  "arkansas_razorbacks", "North",
+  "belmont_bruins", "North",
+  "charleston_cougars", "North",
+  "charlotte_49ers", "North",
+  "davidson_wildcats", "North",
+  "elon_phoenix", "North",
+  "florida_gators", "North",
+  "florida_gulf_coast_eagles", "North",
+  "florida_state_seminoles", "North",
+  "freed_hardeman_lions", "North",
+  "furman_paladins", "North",
+  "gardner_webb_runnin_bulldogs", "North",
+  "georgia_lady_bulldogs", "North",
+  "georgia_southern_eagles", "North",
+  "georgia_tech_yellow_jackets", "North",
+  "high_point_panthers", "North",
+  "houston_christian_huskies", "North",
+  "houston_cougars", "North",
+  "jackson_state_lady_tigers", "North",
+  "jacksonville_dolphins", "North",
+  "jacksonville_state_gamecocks", "North",
+  "little_rock_trojans", "North",
+  "louisiana_ragin_cajuns", "North",
+  "louisiana_tech_lady_techsters", "North",
+  "lsu_tigers", "North",
+  "memphis_tigers", "North",
+  "mercer_bears", "North",
+  "miami_hurricanes", "North",
+  "middle_tennessee_blue_raiders", "North",
+  "ole_miss_rebels", "North",
+  "oral_roberts_golden_eagles", "North",
+  "rice_owls", "North",
+  "se_louisiana_lady_lions", "North",
+  "south_carolina_gamecocks", "North",
+  "south_carolina_upstate_spartans", "North",
+  "south_florida_bulls", "North",
+  "southern_miss_lady_eagles", "North",
+  "stephen_f_austin_ladyjacks", "North",
+  "stetson_hatters", "North",
+  "tennessee_lady_volunteers", "North",
+  "tennessee_tech_golden_eagles", "North",
+  "troy_trojans", "North",
+  "tulane_green_wave", "North",
+  "tulsa_golden_hurricane", "North",
+  "ucf_knights", "North",
+  "wofford_terriers", "North",
+  # South Region teams
+  "akron_zips", "South",
+  "app_state_mountaineers", "South",
+  "austin_peay_governors", "South",
+  "ball_state_cardinals", "South",
+  "cleveland_state_vikings", "South",
+  "coker_cobras", "South",
+  "dayton_flyers", "South",
+  "depaul_blue_demons", "South",
+  "drake_bulldogs", "South",
+  "eastern_illinois_panthers", "South",
+  "green_bay_phoenix", "South",
+  "illinois_state_redbirds", "South",
+  "indiana_hoosiers", "South",
+  "iowa_hawkeyes", "South",
+  "iowa_state_cyclones", "South",
+  "iu_indianapolis_jaguars", "South",
+  "kansas_city_roos", "South",
+  "kansas_jayhawks", "South",
+  "kent_state_golden_flashes", "South",
+  "kentucky_wildcats", "South",
+  "louisville_cardinals", "South",
+  "loyola_chicago_ramblers", "South",
+  "marquette_golden_eagles", "South",
+  "marshall_thundering_herd", "South",
+  "michigan_state_spartans", "South",
+  "michigan_wolverines", "South",
+  "missouri_state_lady_bears", "South",
+  "missouri_tigers", "South",
+  "murray_state_racers", "South",
+  "northern_iowa_panthers", "South",
+  "northern_kentucky_norse", "South",
+  "northwestern_wildcats", "South",
+  "notre_dame_fighting_irish", "South",
+  "ohio_bobcats", "South",
+  "ohio_state_buckeyes", "South",
+  "purdue_boilermakers", "South",
+  "southern_illinois_salukis", "South",
+  "toledo_rockets", "South",
+  "unc_pembroke_braves", "South",
+  "virginia_tech_hokies", "South",
+  "western_kentucky_lady_toppers", "South",
+  "western_michigan_broncos", "South",
+  "youngstown_state_penguins", "South",
+  # West Region teams
+  "abilene_christian_wildcats", "West",
+  "air_force_falcons", "West",
+  "arizona_wildcats", "West",
+  "baylor_bears", "West",
+  "byu_cougars", "West",
+  "california_baptist_lancers", "West",
+  "colorado_buffaloes", "West",
+  "colorado_state_rams", "West",
+  "creighton_bluejays", "West",
+  "gonzaga_bulldogs", "West",
+  "grand_canyon_lopes", "West",
+  "hawaii_rainbow_wahine", "West",
+  "idaho_state_bengals", "West",
+  "kansas_state_wildcats", "West",
+  "long_beach_state_beach", "West",
+  "montana_lady_griz", "West",
+  "montana_state_bobcats", "West",
+  "nebraska_cornhuskers", "West",
+  "nevada_wolf_pack", "West",
+  "new_mexico_lobos", "West",
+  "north_texas_mean_green", "West",
+  "northern_arizona_lumberjacks", "West",
+  "oklahoma_sooners", "West",
+  "oregon_ducks", "West",
+  "portland_pilots", "West",
+  "san_diego_toreros", "West",
+  "san_francisco_dons", "West",
+  "santa_clara_broncos", "West",
+  "south_dakota_coyotes", "West",
+  "south_dakota_state_jackrabbits", "West",
+  "southern_utah_thunderbirds", "West",
+  "stanford_cardinal", "West",
+  "tarleton_state_texans", "West",
+  "texas_am_corpus_christi_islanders", "West",
+  "texas_am_international_dustdevils", "West",
+  "texas_longhorns", "West",
+  "texas_state_bobcats", "West",
+  "uc_davis_aggies", "West",
+  "uc_irvine_anteaters", "West",
+  "uc_riverside_highlanders", "West",
+  "uc_santa_barbara_gauchos", "West",
+  "ucla_bruins", "West",
+  "unlv_lady_rebels", "West",
+  "ut_arlington_mavericks", "West",
+  "utah_utes", "West",
+  "utah_valley_wolverines", "West",
+  "washington_state_cougars", "West",
+  "wyoming_cowgirls", "West"
+)
+
+# For regions other than East, assign seeds based on global WHR ratings.
+whr_df <- tibble(team = names(whr_ratings), whr_rating = whr_ratings)
+
+unseeded_seeding <- team_regions %>% 
+  filter(region != "East") %>% 
+  left_join(whr_df, by = "team") %>% 
+  arrange(region, desc(whr_rating)) %>% 
+  group_by(region) %>% 
+  mutate(seed = row_number()) %>% 
+  ungroup()
+
+cat("\nSeeding for unseeded regions (based on WHR ratings):\n")
+print(unseeded_seeding)
+
+###############################################################################
+# 8) Model Validation: Overfitting, Learning Curves, and Calibration
+###############################################################################
+validation_results <- validate_model(train_model_df, xgb_final, test_fe, final_params)
+plots <- plot_validation_results(validation_results)
+cat("\nValidation analysis complete.\n")
+
+###############################################################################
+# End of Script
+###############################################################################
